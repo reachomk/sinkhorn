@@ -179,6 +179,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--grad-clip", type=float, default=2.0)
     p.add_argument("--ema-decay", type=float, default=0.999)
     p.add_argument("--amp", action="store_true", help="Use torch AMP for generator+encoder forward/backward.")
+    p.add_argument(
+        "--amp-dtype",
+        type=str,
+        choices=["fp16", "bf16"],
+        default="fp16",
+        help="AMP autocast dtype (CUDA only). bf16 is typically more stable than fp16 and does not use GradScaler.",
+    )
+    p.add_argument(
+        "--tf32",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override TF32 backend flags for CUDA matmul/conv (default: do not change PyTorch defaults).",
+    )
 
     # Logging / checkpoints
     p.add_argument("--run-root", type=str, default="runs/imagenet_drift")
@@ -470,6 +483,15 @@ def main() -> None:
     dist_info = init_distributed(device=args.device)
     seed_all(args.seed + dist_info.rank)
 
+    # Optional performance knobs (do not change defaults unless explicitly requested).
+    if args.tf32 is not None and dist_info.device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
+        torch.backends.cudnn.allow_tf32 = bool(args.tf32)
+        try:
+            torch.set_float32_matmul_precision("high" if bool(args.tf32) else "highest")
+        except Exception:
+            pass
+
     if is_main_process():
         print(
             "drift_cfg="
@@ -483,6 +505,9 @@ def main() -> None:
                     "sinkhorn_iters": int(args.sinkhorn_iters),
                     "sinkhorn_marginal": str(args.sinkhorn_marginal),
                     "temps": str(args.temps),
+                    "amp": bool(args.amp),
+                    "amp_dtype": str(args.amp_dtype),
+                    "tf32": (None if args.tf32 is None else bool(args.tf32)),
                 },
                 sort_keys=True,
             )
@@ -596,7 +621,17 @@ def main() -> None:
         betas=(float(args.beta1), float(args.beta2)),
         weight_decay=float(args.weight_decay),
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp) and dist_info.device.type == "cuda")
+
+    use_amp = bool(args.amp) and dist_info.device.type == "cuda"
+    amp_dtype = torch.float16 if str(args.amp_dtype) == "fp16" else torch.bfloat16
+    use_scaler = use_amp and amp_dtype == torch.float16
+    if dist_info.device.type == "cuda":
+        try:
+            scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+        except Exception:
+            scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    else:
+        scaler = None
     ema = EMA(gen, decay=float(args.ema_decay))
 
     if resume_ckpt is not None:
@@ -608,7 +643,7 @@ def main() -> None:
                 print(f"Warning: resume checkpoint has no optimizer state: {args.resume} (optimizer will restart)")
         if "ema" in resume_ckpt:
             ema.load_state_dict(resume_ckpt["ema"])
-        if "scaler" in resume_ckpt:
+        if scaler is not None and resume_ckpt.get("scaler") is not None:
             scaler.load_state_dict(resume_ckpt["scaler"])
 
     run_name = args.run_name or f"drift_dit_b2_steps{args.steps}_nc{args.nc}_nneg{args.nneg}_npos{args.npos}"
@@ -750,7 +785,7 @@ def main() -> None:
                 else nullcontext()
             )
             with sync_ctx:
-                amp_ctx = torch.autocast(device_type=dist_info.device.type, enabled=bool(args.amp) and dist_info.device.type == "cuda")
+                amp_ctx = torch.autocast(device_type=dist_info.device.type, dtype=amp_dtype, enabled=use_amp)
                 with amp_ctx:
                     x_lat = ddp_gen(z, c_lab, omega_rep)  # [Nneg,4,32,32]
 
@@ -811,7 +846,10 @@ def main() -> None:
                     # Normalize by number of classes on this rank to keep step loss stable.
                     class_loss = class_loss / float(nc_local)
 
-                scaler.scale(class_loss).backward()
+                if scaler is not None and use_scaler:
+                    scaler.scale(class_loss).backward()
+                else:
+                    class_loss.backward()
 
             class_loss_v = float(class_loss.detach().item())
             if not math.isfinite(class_loss_v):
@@ -820,11 +858,15 @@ def main() -> None:
 
         # Step optimizer.
         if args.grad_clip and args.grad_clip > 0:
-            scaler.unscale_(opt)
+            if scaler is not None and use_scaler:
+                scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(ddp_gen.parameters(), max_norm=float(args.grad_clip))
 
-        scaler.step(opt)
-        scaler.update()
+        if scaler is not None and use_scaler:
+            scaler.step(opt)
+            scaler.update()
+        else:
+            opt.step()
         ema.update(gen)
 
         # Logging (reduce mean across ranks).
@@ -850,6 +892,10 @@ def main() -> None:
                 "loss_isfinite": bool(math.isfinite(loss_mean)),
                 "drift_norm": drift_norm,
                 "nan_count": nan_global,
+                "amp": bool(use_amp),
+                "amp_dtype": (str(args.amp_dtype) if bool(use_amp) else "fp32"),
+                "scaler_scale": (float(scaler.get_scale()) if (scaler is not None and use_scaler) else None),
+                "tf32": (None if args.tf32 is None else bool(args.tf32)),
             }
             if drift_stats is not None:
                 rec["drift_stats_name"] = drift_stats_name
@@ -867,7 +913,7 @@ def main() -> None:
                 "gen": gen.state_dict(),
                 "opt": opt.state_dict(),
                 "ema": ema.state_dict(),
-                "scaler": scaler.state_dict(),
+                "scaler": scaler.state_dict() if scaler is not None else None,
                 "rng_queue_state": rng_queue_state,
                 "drift_cfg": {
                     "drift_form": str(args.drift_form),
@@ -894,7 +940,7 @@ def main() -> None:
             "gen": gen.state_dict(),
             "opt": opt.state_dict(),
             "ema": ema.state_dict(),
-            "scaler": scaler.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "rng_queue_state": rng_queue_state,
             "drift_cfg": {
                 "drift_form": str(args.drift_form),
