@@ -91,7 +91,11 @@ def feature_sets_from_feature_map(fmap: torch.Tensor, *, prefix: str) -> list[Fe
     # (b) Global mean/std (C-dim each) => L=2.
     mean = fmap.mean(dim=(2, 3))
     mean_sq = (fmap * fmap).mean(dim=(2, 3))
-    std = torch.sqrt((mean_sq - mean * mean).clamp_min(0.0))
+    # NOTE: we add a small epsilon inside sqrt to avoid NaN gradients when the
+    # variance is exactly zero. Without this, d/dx sqrt(x) is infinite at x=0,
+    # and autograd can produce 0*inf -> NaN for constant channels.
+    std_eps = 1e-6
+    std = torch.sqrt((mean_sq - mean * mean).clamp_min(0.0) + std_eps)
     global_ms = torch.stack([mean, std], dim=1)  # [N,2,C]
 
     out: list[FeatureSet] = [
@@ -105,7 +109,7 @@ def feature_sets_from_feature_map(fmap: torch.Tensor, *, prefix: str) -> list[Fe
             continue
         mean_p = F.avg_pool2d(fmap, kernel_size=p, stride=p)
         mean_sq_p = F.avg_pool2d(fmap * fmap, kernel_size=p, stride=p)
-        std_p = torch.sqrt((mean_sq_p - mean_p * mean_p).clamp_min(0.0))
+        std_p = torch.sqrt((mean_sq_p - mean_p * mean_p).clamp_min(0.0) + std_eps)
         hp, wp = mean_p.shape[-2:]
         mean_v = mean_p.permute(0, 2, 3, 1).contiguous().view(n, hp * wp, c)
         std_v = std_p.permute(0, 2, 3, 1).contiguous().view(n, hp * wp, c)
@@ -229,7 +233,13 @@ def _partial_two_sided_from_logits(
     if impl == "logspace":
         log_row_sum = torch.logsumexp(logits, dim=-1, keepdim=True)
         log_col_sum = torch.logsumexp(logits, dim=-2, keepdim=True)
-        return torch.exp(logits - 0.5 * (log_row_sum + log_col_sum))
+        log_a = logits - 0.5 * (log_row_sum + log_col_sum)
+        # Important for CFG (Appendix A.7): when w(ω)=0 we set log(w)=-inf,
+        # producing all-(-inf) unconditional columns. The log-space formula
+        # would otherwise create NaNs via (-inf) - (-inf). Those entries should
+        # correspond to exactly zero kernel mass, matching the "kernel" impl.
+        log_a = log_a.masked_fill(torch.isneginf(logits), -math.inf)
+        return torch.exp(log_a)
     raise ValueError(f"Unknown impl: {impl}")
 
 
@@ -365,7 +375,9 @@ def _alg2_from_distances(
     elif impl == "logspace":
         log_row_sum = torch.logsumexp(logits, dim=-1, keepdim=True)
         log_col_sum = torch.logsumexp(logits, dim=-2, keepdim=True)
-        A = torch.exp(logits - 0.5 * (log_row_sum + log_col_sum))
+        log_a = logits - 0.5 * (log_row_sum + log_col_sum)
+        log_a = log_a.masked_fill(torch.isneginf(logits), -math.inf)
+        A = torch.exp(log_a)
     else:
         raise ValueError(f"Unknown impl: {impl}")
 

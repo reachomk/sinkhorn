@@ -262,6 +262,42 @@ def test_sinkhorn_none_rejects_nonpositive_cfg_weight() -> None:
 
 
 @torch.no_grad()
+def test_partial_two_sided_logspace_handles_omega_one() -> None:
+    # omega=1 => w(omega)=0 (Appendix A.7). For the paper baseline coupling
+    # (partial_two_sided), this should simply remove unconditional columns from
+    # the kernel, not produce NaNs.
+    torch.manual_seed(3)
+    x = torch.randn(4, 2, 6)
+    y_pos = torch.randn(5, 2, 6)
+    y_unc = torch.randn(3, 2, 6)
+    omega = torch.tensor(1.0)
+    temps = [0.2]
+
+    loss_logspace = drifting_loss_for_feature_set(
+        x,
+        y_pos,
+        y_unc,
+        omega=omega,
+        temps=temps,
+        drift_form="alg2_joint",
+        coupling="partial_two_sided",
+        impl="logspace",
+    )
+    loss_kernel = drifting_loss_for_feature_set(
+        x,
+        y_pos,
+        y_unc,
+        omega=omega,
+        temps=temps,
+        drift_form="alg2_joint",
+        coupling="partial_two_sided",
+        impl="kernel",
+    )
+    assert torch.isfinite(loss_logspace)
+    torch.testing.assert_close(loss_logspace, loss_kernel, rtol=0, atol=1e-6)
+
+
+@torch.no_grad()
 def test_l2_sq_distance_mode_runs() -> None:
     torch.manual_seed(1)
     x = torch.randn(4, 2, 6)
