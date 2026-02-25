@@ -76,7 +76,7 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--vae-id", type=str, default="stabilityai/sd-vae-ft-ema")
     p.add_argument("--vae-scale", type=float, default=0.18215)
-    p.add_argument("--vae-dtype", type=str, choices=["fp16", "fp32"], default="fp16")
+    p.add_argument("--vae-dtype", type=str, choices=["fp16", "fp32"], default="fp32")
     p.add_argument("--vae-encode", type=str, choices=["mean", "sample"], default="mean")
 
     p.add_argument("--merge", action="store_true", help="If DDP, merge shards into a single file on rank0.")

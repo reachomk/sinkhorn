@@ -8,7 +8,7 @@ Kaiming's paper alignment
 - Appendix A.2:
   generator architecture ('imagenet.models.dit_b2.DiTLatentB2').
 - Appendix A.3:
-  MAE encoder checkpoint loaded by '--mae-ckpt' as drifting feature extractor.
+  optional MAE encoder checkpoint loaded by '--mae-ckpt' when '--feature-space=mae'.
 - Appendix A.5/A.6:
   feature sets, drift construction, and normalized loss in 'imagenet.drifting_loss'.
 - Appendix A.7:
@@ -45,6 +45,7 @@ from typing import Iterable, Literal
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torchvision.datasets import ImageFolder
 from tqdm import tqdm
 
 from imagenet.data.latents_memmap import final_paths
@@ -80,6 +81,28 @@ def _parse_args() -> argparse.Namespace:
 
     # Data (pre-encoded SD-VAE latents)
     p.add_argument("--latents-dir", type=str, default="data/imagenet256_latents")
+    p.add_argument(
+        "--latents-format",
+        type=str,
+        choices=["auto", "memmap", "sample_npy"],
+        default="auto",
+        help="Latent storage format. 'memmap' expects <split>_latents.npy + <split>_labels.npy; "
+        "'sample_npy' reads per-sample .npy files from save_latents.py; 'auto' tries memmap first then sample_npy.",
+    )
+    p.add_argument(
+        "--latents-run-subdir",
+        type=str,
+        default="",
+        help="Optional run subdirectory under --latents-dir for sample_npy latents "
+        "(e.g. RAE-pretrained-bs32-fp32).",
+    )
+    p.add_argument(
+        "--latents-data-path",
+        type=str,
+        default="/datasets/imagenet/train",
+        help="ImageFolder path used during save_latents.py encoding (e.g. /datasets/imagenet/train). "
+        "Required for --latents-format=sample_npy to reconstruct class labels from sample indices.",
+    )
     p.add_argument("--split", type=str, default="train", choices=["train", "val"])
     p.add_argument("--num-classes", type=int, default=1000)
     p.add_argument("--max-items", type=int, default=0, help="Debug: use only first N items (0=all).")
@@ -93,10 +116,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--queue-global-size", type=int, default=1000, help="Global unconditional queue size (Appendix A.8).")
     p.add_argument("--queue-push", type=int, default=64, help="Number of new real samples pushed per step (Appendix A.8).")
 
-    # Feature encoder (latent-MAE)
-    p.add_argument("--mae-ckpt", type=str, required=True)
+    # Feature space for drifting loss.
+    p.add_argument(
+        "--feature-space",
+        type=str,
+        choices=["latent", "mae"],
+        default="latent",
+        help="Feature space used for drifting loss. 'latent' computes loss directly on latents; "
+        "'mae' uses the frozen MAE encoder feature sets.",
+    )
+
+    # Feature encoder (latent-MAE; only used when --feature-space=mae).
+    p.add_argument("--mae-ckpt", type=str, default="", help="Required when --feature-space=mae.")
     p.add_argument("--mae-use-ema", action="store_true", help="Use EMA weights from MAE checkpoint.")
-    p.add_argument("--mae-every-n-blocks", type=int, default=2)
+    p.add_argument("--mae-every-n-blocks", type=int, default=2, help="Used when --feature-space=mae.")
 
     # Generator (DiT-B/2; Table 8)
     p.add_argument("--hidden-dim", type=int, default=768)
@@ -170,7 +203,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--omega-exp", type=float, default=3.0, help="Power-law exponent for p(omega) ∝ omega^{-exp}.")
 
     # Optimizer (Table 8)
-    p.add_argument("--steps", type=int, default=30000)
+    p.add_argument("--steps", type=int, default=25022)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--beta1", type=float, default=0.9)
@@ -246,15 +279,206 @@ def _resume_steps_completed(ckpt_path: str, ckpt: dict) -> int:
     return step
 
 
-def _load_latents(latents_dir: str, split: str) -> tuple[np.memmap, np.memmap]:
-    lat_path, lab_path = final_paths(latents_dir, split)
-    if not os.path.exists(lat_path) or not os.path.exists(lab_path):
-        raise FileNotFoundError(
-            f"Missing latent files. Expected:\n  {lat_path}\n  {lab_path}\nRun: python -m imagenet.encode_latents --split {split} --out-dir {latents_dir} ..."
+class _LatentSource:
+    def __init__(self, latent_shape: tuple[int, int, int]):
+        self.latent_shape = tuple(int(v) for v in latent_shape)
+
+    @property
+    def n_samples(self) -> int:
+        raise NotImplementedError
+
+    def take(self, idx: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    def first_n(self, n: int):
+        raise NotImplementedError
+
+
+class _MemmapLatentSource(_LatentSource):
+    def __init__(self, arr: np.ndarray):
+        if arr.ndim != 4:
+            raise ValueError(f"Expected latent tensor [N,C,H,W], got shape {tuple(arr.shape)}")
+        super().__init__((int(arr.shape[1]), int(arr.shape[2]), int(arr.shape[3])))
+        self.arr = arr
+
+    @property
+    def n_samples(self) -> int:
+        return int(self.arr.shape[0])
+
+    def take(self, idx: np.ndarray) -> np.ndarray:
+        return np.asarray(self.arr[idx])
+
+    def first_n(self, n: int):
+        return _MemmapLatentSource(self.arr[: int(n)])
+
+
+class _SampleNpyLatentSource(_LatentSource):
+    def __init__(self, paths: list[str], latent_shape: tuple[int, int, int], latent_dtype: np.dtype):
+        super().__init__(latent_shape)
+        self.paths = paths
+        self.latent_dtype = np.dtype(latent_dtype)
+
+    @property
+    def n_samples(self) -> int:
+        return int(len(self.paths))
+
+    def take(self, idx: np.ndarray) -> np.ndarray:
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        out = np.empty((int(idx.shape[0]), *self.latent_shape), dtype=self.latent_dtype)
+        for j, ii in enumerate(idx):
+            out[j] = np.load(self.paths[int(ii)], mmap_mode="r")
+        return out
+
+    def first_n(self, n: int):
+        return _SampleNpyLatentSource(self.paths[: int(n)], self.latent_shape, self.latent_dtype)
+
+
+def _has_numeric_npy_files(root: Path) -> bool:
+    if not root.is_dir():
+        return False
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if not fn.endswith(".npy"):
+                continue
+            stem = fn[:-4]
+            if stem.isdigit():
+                return True
+    return False
+
+
+def _has_top_level_numeric_npy_files(root: Path) -> bool:
+    if not root.is_dir():
+        return False
+    for p in root.iterdir():
+        if p.is_file() and p.suffix == ".npy" and p.stem.isdigit():
+            return True
+    return False
+
+
+def _resolve_sample_npy_root(latents_dir: str, run_subdir: str) -> Path:
+    base = Path(latents_dir)
+    if run_subdir:
+        root = (base / run_subdir).resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"--latents-run-subdir does not exist under --latents-dir: {root}")
+        return root
+
+    if _has_top_level_numeric_npy_files(base):
+        return base.resolve()
+
+    candidates: list[Path] = []
+    if base.is_dir():
+        for p in sorted(base.iterdir()):
+            if p.is_dir() and _has_numeric_npy_files(p):
+                candidates.append(p.resolve())
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1 and all(p.name.isdigit() for p in candidates):
+        # save_latents.py can shard samples into numeric subfolders (00000, 00001, ...).
+        # In that case, the base directory itself is the run root.
+        return base.resolve()
+    if len(candidates) > 1:
+        names = "\n".join(f"  - {str(p)}" for p in candidates)
+        raise ValueError(
+            "Multiple sample-latent run directories found. Please set --latents-run-subdir.\n"
+            f"Candidates:\n{names}"
         )
-    lat = np.load(lat_path, mmap_mode="r")
-    lab = np.load(lab_path, mmap_mode="r")
-    return lat, lab
+    raise FileNotFoundError(
+        f"Could not find numeric per-sample .npy latents under {base}. "
+        "Point --latents-dir to your save_latents.py output or set --latents-run-subdir."
+    )
+
+
+def _collect_sample_npy_paths(root: Path) -> tuple[list[int], list[str]]:
+    pairs: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if not fn.endswith(".npy"):
+                continue
+            stem = fn[:-4]
+            if not stem.isdigit():
+                continue
+            idx = int(stem)
+            if idx in seen:
+                raise ValueError(f"Duplicate latent sample index found in {root}: {idx}")
+            seen.add(idx)
+            pairs.append((idx, str(Path(dirpath) / fn)))
+    if not pairs:
+        raise FileNotFoundError(f"No numeric per-sample .npy files found under {root}")
+    pairs.sort(key=lambda x: x[0])
+    raw_idx = [p[0] for p in pairs]
+    paths = [p[1] for p in pairs]
+    return raw_idx, paths
+
+
+def _load_imagefolder_targets(path: str) -> np.ndarray:
+    ds = ImageFolder(path)
+    if len(ds.targets) != len(ds.samples):
+        raise ValueError(f"ImageFolder targets/samples length mismatch for {path}")
+    return np.asarray(ds.targets, dtype=np.int64)
+
+
+def _load_latents_any(
+    *,
+    latents_dir: str,
+    split: str,
+    latents_format: str,
+    latents_run_subdir: str,
+    latents_data_path: str,
+) -> tuple[_LatentSource, np.ndarray, str]:
+    lat_path, lab_path = final_paths(latents_dir, split)
+    memmap_exists = os.path.exists(lat_path) and os.path.exists(lab_path)
+
+    use_format = str(latents_format)
+    if use_format == "auto":
+        use_format = "memmap" if memmap_exists else "sample_npy"
+
+    if use_format == "memmap":
+        if not memmap_exists:
+            raise FileNotFoundError(
+                f"Missing memmap latent files. Expected:\n  {lat_path}\n  {lab_path}\n"
+                "Or set --latents-format sample_npy for save_latents.py outputs."
+            )
+        lat = np.load(lat_path, mmap_mode="r")
+        lab = np.load(lab_path, mmap_mode="r")
+        if int(lat.shape[0]) != int(lab.shape[0]):
+            raise ValueError(f"Latents/labels size mismatch: {lat.shape} vs {lab.shape}")
+        return _MemmapLatentSource(lat), np.asarray(lab, dtype=np.int64), "memmap"
+
+    if use_format != "sample_npy":
+        raise ValueError(f"Unknown --latents-format: {latents_format}")
+
+    if not latents_data_path:
+        raise ValueError("--latents-data-path is required for --latents-format=sample_npy")
+
+    sample_root = _resolve_sample_npy_root(latents_dir, latents_run_subdir)
+    raw_idx, paths = _collect_sample_npy_paths(sample_root)
+    targets = _load_imagefolder_targets(latents_data_path)
+
+    kept_paths: list[str] = []
+    labels: list[int] = []
+    for ii, p in zip(raw_idx, paths):
+        if ii < 0 or ii >= int(targets.shape[0]):
+            continue
+        kept_paths.append(p)
+        labels.append(int(targets[ii]))
+
+    if not kept_paths:
+        raise RuntimeError(
+            f"Found sample .npy files under {sample_root}, but none map to ImageFolder indices in {latents_data_path}."
+        )
+
+    probe = np.load(kept_paths[0], mmap_mode="r")
+    if probe.ndim != 3:
+        raise ValueError(f"Expected per-sample latent shape [C,H,W], got {tuple(probe.shape)} at {kept_paths[0]}")
+    latent_shape = (int(probe.shape[0]), int(probe.shape[1]), int(probe.shape[2]))
+    latent_dtype = np.dtype(probe.dtype)
+    return (
+        _SampleNpyLatentSource(kept_paths, latent_shape=latent_shape, latent_dtype=latent_dtype),
+        np.asarray(labels, dtype=np.int64),
+        f"sample_npy:{sample_root}",
+    )
 
 
 def _build_indices_by_class(labels: np.ndarray, num_classes: int) -> list[np.ndarray]:
@@ -479,6 +703,8 @@ def main() -> None:
             )
     if str(args.sinkhorn_marginal) != "none" and str(args.coupling) != "sinkhorn":
         raise ValueError("--sinkhorn-marginal is only valid when --coupling=sinkhorn")
+    if str(args.feature_space) == "mae" and not str(args.mae_ckpt):
+        raise ValueError("--mae-ckpt is required when --feature-space=mae")
 
     dist_info = init_distributed(device=args.device)
     seed_all(args.seed + dist_info.rank)
@@ -497,6 +723,7 @@ def main() -> None:
             "drift_cfg="
             + json.dumps(
                 {
+                    "feature_space": str(args.feature_space),
                     "drift_form": str(args.drift_form),
                     "coupling": str(args.coupling),
                     "alg2_impl": str(args.alg2_impl),
@@ -529,14 +756,27 @@ def main() -> None:
         raise ValueError("--temps must be non-empty")
 
     # Load latents + labels.
-    lat_mm, lab_mm = _load_latents(args.latents_dir, args.split)
-    n_data = int(lab_mm.shape[0])
+    lat_src, labels_np, latents_source = _load_latents_any(
+        latents_dir=args.latents_dir,
+        split=args.split,
+        latents_format=args.latents_format,
+        latents_run_subdir=args.latents_run_subdir,
+        latents_data_path=args.latents_data_path,
+    )
+    n_data = int(lat_src.n_samples)
+    if int(labels_np.shape[0]) != n_data:
+        raise RuntimeError(f"Latents/labels length mismatch: {n_data} vs {int(labels_np.shape[0])}")
     if args.max_items and args.max_items > 0:
         n_data = min(n_data, int(args.max_items))
-        lat_mm = lat_mm[:n_data]
-        lab_mm = lab_mm[:n_data]
+        lat_src = lat_src.first_n(n_data)
+        labels_np = labels_np[:n_data]
 
-    labels_np = np.asarray(lab_mm, dtype=np.int64)
+    latent_ch, latent_h, latent_w = lat_src.latent_shape
+    if latent_h != latent_w:
+        raise ValueError(f"Only square latent maps are currently supported, got [C,H,W]={lat_src.latent_shape}")
+    if (latent_h % 2) != 0:
+        raise ValueError(f"Latent size must be divisible by patch size 2, got H=W={latent_h}")
+
     idx_by_class = _build_indices_by_class(labels_np, num_classes=int(args.num_classes))
     available_classes = [c for c in range(int(args.num_classes)) if idx_by_class[c].shape[0] >= int(args.npos)]
     if len(available_classes) < int(args.nc):
@@ -588,8 +828,27 @@ def main() -> None:
             elif queue is None and qstate is not None and is_main_process():
                 print("Warning: checkpoint contains sample queue state but --sample-queue is disabled.")
 
-    # Feature encoder (MAE encoder, frozen).
-    encoder, mae_meta = _load_mae_encoder(args.mae_ckpt, dist_info.device, use_ema=bool(args.mae_use_ema))
+    use_mae_features = str(args.feature_space) == "mae"
+    if use_mae_features:
+        # Feature encoder (MAE encoder, frozen).
+        encoder, mae_meta = _load_mae_encoder(args.mae_ckpt, dist_info.device, use_ema=bool(args.mae_use_ema))
+        mae_cfg_dict = mae_meta.get("mae_cfg", {})
+        mae_in_ch = mae_cfg_dict.get("in_ch")
+        if mae_in_ch is not None and int(mae_in_ch) != int(latent_ch):
+            raise ValueError(
+                f"MAE checkpoint in_ch mismatch: ckpt has in_ch={mae_in_ch}, but latents have C={latent_ch}. "
+                "Use a MAE checkpoint trained on the same latent channels."
+            )
+        conv1 = getattr(encoder, "conv1", None)
+        enc_in_ch = getattr(conv1, "in_channels", None)
+        if enc_in_ch is not None and int(enc_in_ch) != int(latent_ch):
+            raise ValueError(
+                f"Loaded MAE encoder expects C={enc_in_ch}, but latents have C={latent_ch}. "
+                "Use a compatible MAE checkpoint."
+            )
+    else:
+        encoder = None
+        mae_meta = {}
 
     # Generator.
     if resume_ckpt is not None and isinstance(resume_ckpt.get("dit_cfg"), dict):
@@ -600,6 +859,9 @@ def main() -> None:
     else:
         dit_cfg = DiTB2Config(
             num_classes=int(args.num_classes),
+            in_ch=int(latent_ch),
+            out_ch=int(latent_ch),
+            input_size=int(latent_h),
             hidden_dim=int(args.hidden_dim),
             depth=int(args.depth),
             n_heads=int(args.n_heads),
@@ -607,6 +869,12 @@ def main() -> None:
             register_tokens=int(args.register_tokens),
             style_codebook=int(args.style_codebook),
             style_tokens=int(args.style_tokens),
+        )
+    if int(dit_cfg.in_ch) != int(latent_ch) or int(dit_cfg.out_ch) != int(latent_ch) or int(dit_cfg.input_size) != int(latent_h):
+        raise ValueError(
+            "Generator config/latent shape mismatch: "
+            f"dit_cfg(in_ch={dit_cfg.in_ch}, out_ch={dit_cfg.out_ch}, input_size={dit_cfg.input_size}) vs "
+            f"latents[{latent_ch},{latent_h},{latent_w}]."
         )
     gen = DiTLatentB2(dit_cfg).to(dist_info.device)
     ddp_gen = (
@@ -670,6 +938,8 @@ def main() -> None:
                 **mae_meta,
                 "nc_local": nc_local,
                 "n_data": n_data,
+                "latents_source": latents_source,
+                "latent_shape": [int(latent_ch), int(latent_h), int(latent_w)],
             },
         )
     log_path = os.path.join(run.run_dir, "logs.jsonl")
@@ -677,6 +947,8 @@ def main() -> None:
     if is_main_process():
         print(f"Run dir: {run.run_dir}")
         print(f"DDP={dist_info.distributed} world={dist_info.world_size} nc_local={nc_local}")
+        print(f"Feature space={args.feature_space}")
+        print(f"Latents source={latents_source} shape=[{latent_ch},{latent_h},{latent_w}] n={n_data}")
         if args.resume:
             print(f"Resuming from: {args.resume} (start_step={start_step} -> steps={args.steps})")
 
@@ -759,7 +1031,7 @@ def main() -> None:
                 drift_stats["drift_omega"] = float(omega_c.detach().float().cpu().item())
 
             # Noise -> generated latents
-            z = torch.randn(int(args.nneg), 4, 32, 32, device=dist_info.device)
+            z = torch.randn(int(args.nneg), latent_ch, latent_h, latent_w, device=dist_info.device)
             c_lab = torch.full((int(args.nneg),), c, device=dist_info.device, dtype=torch.long)
             omega_rep = omega_c.expand(int(args.nneg))
 
@@ -776,8 +1048,12 @@ def main() -> None:
                     else np.empty((0,), dtype=np.int64)
                 )
 
-            pos_lat = torch.from_numpy(lat_mm[pos_idx]).to(dist_info.device).float()
-            uncond_lat = torch.from_numpy(lat_mm[uncond_idx]).to(dist_info.device).float() if args.nuncond > 0 else torch.empty((0, 4, 32, 32), device=dist_info.device)
+            pos_lat = torch.from_numpy(lat_src.take(pos_idx)).to(dist_info.device).float()
+            uncond_lat = (
+                torch.from_numpy(lat_src.take(uncond_idx)).to(dist_info.device).float()
+                if args.nuncond > 0
+                else torch.empty((0, latent_ch, latent_h, latent_w), device=dist_info.device)
+            )
 
             sync_ctx = (
                 ddp_gen.no_sync()
@@ -785,36 +1061,45 @@ def main() -> None:
                 else nullcontext()
             )
             with sync_ctx:
-                amp_ctx = torch.autocast(device_type=dist_info.device.type, dtype=amp_dtype, enabled=use_amp)
+                autocast_dtype = amp_dtype if dist_info.device.type != "cpu" else torch.bfloat16
+                amp_ctx = torch.autocast(device_type=dist_info.device.type, dtype=autocast_dtype, enabled=use_amp)
                 with amp_ctx:
-                    x_lat = ddp_gen(z, c_lab, omega_rep)  # [Nneg,4,32,32]
+                    x_lat = ddp_gen(z, c_lab, omega_rep)  # [Nneg,C,H,W]
 
-                    # Generated features WITH grad.
-                    maps_x = encoder.forward_feature_maps(x_lat, every_n_blocks=int(args.mae_every_n_blocks))
-                    x_sets = []
-                    for mi, fmap in enumerate(maps_x):
-                        x_sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
-                    x_sets.extend(feature_sets_from_encoder_input(x_lat))
-                    x_sets.append(flatten_latents_as_feature_set(x_lat))
+                    if use_mae_features:
+                        assert encoder is not None
+                        # Generated features WITH grad.
+                        maps_x = encoder.forward_feature_maps(x_lat, every_n_blocks=int(args.mae_every_n_blocks))
+                        x_sets = []
+                        for mi, fmap in enumerate(maps_x):
+                            x_sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
+                        x_sets.extend(feature_sets_from_encoder_input(x_lat))
+                        x_sets.append(flatten_latents_as_feature_set(x_lat))
 
-                    # Real features under no_grad (stop-grad in drift construction).
-                    with torch.no_grad():
-                        maps_pos = encoder.forward_feature_maps(pos_lat, every_n_blocks=int(args.mae_every_n_blocks))
-                        pos_sets = []
-                        for mi, fmap in enumerate(maps_pos):
-                            pos_sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
-                        pos_sets.extend(feature_sets_from_encoder_input(pos_lat))
-                        pos_sets.append(flatten_latents_as_feature_set(pos_lat))
+                        # Real features under no_grad (stop-grad in drift construction).
+                        with torch.no_grad():
+                            maps_pos = encoder.forward_feature_maps(pos_lat, every_n_blocks=int(args.mae_every_n_blocks))
+                            pos_sets = []
+                            for mi, fmap in enumerate(maps_pos):
+                                pos_sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
+                            pos_sets.extend(feature_sets_from_encoder_input(pos_lat))
+                            pos_sets.append(flatten_latents_as_feature_set(pos_lat))
 
-                        if int(args.nuncond) > 0:
-                            maps_unc = encoder.forward_feature_maps(uncond_lat, every_n_blocks=int(args.mae_every_n_blocks))
-                            unc_sets = []
-                            for mi, fmap in enumerate(maps_unc):
-                                unc_sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
-                            unc_sets.extend(feature_sets_from_encoder_input(uncond_lat))
-                            unc_sets.append(flatten_latents_as_feature_set(uncond_lat))
-                        else:
-                            unc_sets = []
+                            if int(args.nuncond) > 0:
+                                maps_unc = encoder.forward_feature_maps(uncond_lat, every_n_blocks=int(args.mae_every_n_blocks))
+                                unc_sets = []
+                                for mi, fmap in enumerate(maps_unc):
+                                    unc_sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
+                                unc_sets.extend(feature_sets_from_encoder_input(uncond_lat))
+                                unc_sets.append(flatten_latents_as_feature_set(uncond_lat))
+                            else:
+                                unc_sets = []
+                    else:
+                        # Drifting directly in latent space: no extra feature encoder.
+                        x_sets = [flatten_latents_as_feature_set(x_lat)]
+                        with torch.no_grad():
+                            pos_sets = [flatten_latents_as_feature_set(pos_lat)]
+                            unc_sets = [flatten_latents_as_feature_set(uncond_lat)] if int(args.nuncond) > 0 else []
 
                     pos_dict = {fs.name: fs.x for fs in pos_sets}
                     unc_dict = {fs.name: fs.x for fs in unc_sets}
